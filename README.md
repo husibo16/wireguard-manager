@@ -1,7 +1,6 @@
+##  一套面向生产环境的 WireGuard 一体化安装、管理与多子网路由脚本
 
 ---
-
-# ### 一套面向生产环境的 WireGuard 一体化安装、管理与多子网路由脚本
 
 设计一套适用于 **Debian / Ubuntu** 的 **WireGuard 一体化安装与管理脚本**。脚本必须采用 **统一的整体架构**，在同一逻辑框架下分别实现服务端与客户端功能，确保结构一致、行为可预测、维护成本低。
 
@@ -9,6 +8,11 @@
 
 * **服务端（必须有公网 IP）**
 * **客户端（公司内网节点 / 员工终端）**
+
+> 设计原则：  
+> - 服务端 = 控制平面 + 配置中心 + 路由枢纽  
+> - 客户端 = 执行节点 + 连接端，不做策略  
+> - 所有复杂性、策略和配置生成，全部集中在服务端统一管理。
 
 ---
 
@@ -19,26 +23,32 @@
 ### 核心职责
 
 * 初始化服务端环境（安装、密钥、wg 接口、基础配置）
-* **统一创建客户端：自动生成密钥 / 配置文件 / 分配地址**
+* **统一创建客户端：自动生成密钥 / 配置文件 / 分配地址 / 二维码**
 * 管理所有客户端（新增 / 删除 / 列表 / 配置导出）
 * 控制 WireGuard 连接（启动、停止、重载、状态查询）
+
+> 说明：  
+> - 所有客户端密钥与配置由服务端统一生成，避免地址冲突与策略分裂。  
+> - 服务端掌握所有节点的公钥与 AllowedIPs，才能做统一访问控制。  
+> - 客户端“零配置”，是降低使用门槛和减少错误的关键设计。
 
 ### 网络职责
 
 * 启用 IPv4 / IPv6 转发
 * 设置 NAT、iptables、防火墙规则
-* 维护多子网（如公司内网 192.168.x.0/24）
-* 实现跨子网访问：
+* 维护多子网（如公司内网 `192.168.x.0/24`）
+* 实现跨子网访问（员工通过 VPS 访问公司内网）：
 
-```
+```text
 员工 → VPS（服务端） → 公司内网节点 → 公司服务器
-```
+````
 
 ### 架构要求
 
 * 服务端承担所有策略决策与配置生成
 * 客户端不做密钥、不做策略、不做 NAT
 * 服务端配置结构必须稳定、清晰、可扩展
+* 支持长期 7×24 小时运行，重启与异常后可自动恢复
 
 ---
 
@@ -49,367 +59,319 @@
 ### 客户端职责
 
 * 安装 WireGuard
-* 导入服务端生成的配置
+* 导入服务端生成的配置（文件或二维码）
 * 执行启动 / 停止 / 状态
-* 使用服务端提供的 routing 规则自动访问资源
+* 使用服务端提供的路由策略访问资源
 
 ### 特殊客户端（公司内网节点）
 
 用于“公司内网穿透”，额外职责：
 
-* 向服务端声明本地内网子网（如 192.168.50.0/24）
+* 向服务端声明本地内网子网（如 `192.168.50.0/24`）
 * 自动设置本地路由
-* 允许外出员工通过 VPS 访问公司服务器
+* 允许外出员工通过 VPS 访问公司服务器（文件服务器 / ERP / 内网服务等）
 
 ### 客户端架构特点
 
 * 不生成密钥
 * 不生成配置
 * 不做策略决策
-* 逻辑极轻，仅负责连接
-* **服务端统一生成、客户端只执行** 是整体架构稳定的核心原则
+* 逻辑极轻，仅负责连接与本地路由执行
+* **服务端统一生成，客户端只执行**：保证架构稳定、可控、易维护
 
 ---
 
-## 🔵 3. 架构统一：结构固定 + 行为可预测
+## 🔵 3. 架构统一（Agent 架构：UI → Facade → Controller → EventBus → StateEngine → WGAdapter → WireGuard）
 
-脚本必须采用统一的目录结构与模块组织方式：
+本项目采用 **Bash + Python 组合的 Agent 架构**，将“人机交互”和“内核逻辑”彻底分层，整体调用链为：
 
+```text
+UI (Bash)
+  ↓
+Facade (Python CLI 门面)
+  ↓
+Controller (业务流程控制器)
+  ↓
+EventBus (事件总线)
+  ↓
+StateEngine (状态引擎 / 期望态 vs 实际态)
+  ↓
+WGAdapter (WireGuard 适配层)
+  ↓
+WireGuard (系统内核 / wg / ip / iptables)
 ```
+
+> 设计目标：
+>
+> * Bash 只负责交互（菜单）与简单入口，不再承载复杂逻辑。
+> * 所有真正的业务逻辑、状态管理、系统调用由 Python Agent 完成。
+> * 架构可进化：后续换成 Web UI、API、面板，只需替换 UI + Facade，不动底层逻辑。
+
+---
+
+### 3.1 目录结构（Agent 版）
+
+在原有 `/opt/wireguard-manager/` 基础上，重构为：
+
+```text
 /opt/wireguard-manager/
-├── wireguard.sh                  # 主脚本（入口，交互菜单）
+├── wireguard.sh                  # UI 层：Bash 主脚本（入口，交互菜单）
 │
-├── core/                         # 核心引擎（所有模块公用）
-│   ├── core_env.sh               # 全局变量、路径、常量定义
-│   ├── core_log.sh               # 日志系统（INFO/WARN/ERROR/DEBUG）
-│   ├── core_system.sh            # 系统检测、依赖安装、权限检查
-│   ├── core_wg.sh                # WireGuard 操作（密钥/接口/服务）
-│   ├── core_net.sh               # 网络功能（NAT/转发/iptables/路由）
-│   ├── core_config.sh            # 配置文件读写工具
-│   └── core_utils.sh             # 工具函数（校验/UUID/文件操作）
+├── agent/                        # Python Agent（核心逻辑）
+│   ├── __init__.py
+│   ├── facade.py                 # Facade：对外统一调用入口（CLI / 子命令）
+│   ├── controller.py             # Controller：具体业务流程编排
+│   ├── event_bus.py              # EventBus：事件总线（发布/订阅）
+│   ├── state_engine.py           # StateEngine：状态引擎（期望配置 → 实际系统）
+│   ├── wg_adapter.py             # WGAdapter：封装 wg/ip/iptables 等底层命令
+│   ├── models.py                 # 数据模型（Server/Client/Route/Config 等）
+│   ├── storage.py                # 配置持久化（wg-data/meta.json 等）
+│   ├── logger.py                 # 日志中枢（供所有层使用）
+│   └── utils.py                  # 通用工具函数（校验/随机端口/MTU 探测/公网 IP 检测等）
 │
-├── server/                       # 服务端模块（VPS）
-│   ├── server_init.sh            # 初始化服务端
-│   ├── server_add_client.sh      # 添加客户端（密钥/配置/二维码 全自动）
-│   ├── server_del_client.sh      # 删除客户端
-│   ├── server_list.sh            # 客户端列表/状态查看
-│   ├── server_export.sh          # 导出客户端配置（支持单个客户端）
-│   ├── server_reload.sh          # 重载服务
-│   └── server_routes.sh          # 子网 & 多网段路由管理
-│
-├── client/                       # 客户端模块（内网节点 & 员工设备）
-│   ├── client_init.sh            # 初始化客户端环境
-│   ├── client_import.sh          # 导入服务端生成的配置
-│   ├── client_control.sh         # 启动/停止/状态
-│   └── client_route.sh           # 内网节点专用：本地子网路由
-│
-├── wg-data/                      # 服务端客户端数据仓库
-│   ├── server.key                # 服务端私钥
-│   ├── server.pub                # 服务端公钥
-│   ├── wg0.conf                  # 服务端 WireGuard 主配置
+├── wg-data/                      # WireGuard 数据（与原设计一致）
+│   ├── server.key
+│   ├── server.pub
+│   ├── wg0.conf
 │   └── clients/
-│       ├── client01/
-│       │   ├── private.key
-│       │   ├── public.key
-│       │   ├── config.conf
-│       │   ├── qrcode.png        # 安装时自动生成
-│       │   └── meta.json         # 记录 IP、类型、子网等元数据
-│       └── client02/
-│           └── ...
+│       └── client01/
+│           ├── private.key
+│           ├── public.key
+│           ├── config.conf
+│           ├── qrcode.png
+│           └── meta.json
 │
 └── logs/
-    └── wireguard-manager.log     # 全量日志（DEBUG 最详细）
+    └── wireguard-manager.log     # 所有层共用的统一日志输出
 ```
 
-统一逻辑结构：
-
-* 相同错误处理
-* 相同日志格式
-* 相同输入验证
-* 模块化结构严格一致
-
-统一交互结构：
-
-* 安装
-* 查看状态
-* 管理节点
-* 导出配置
-* 查看日志
+> 原来的 `core/*.sh`、`server/*.sh`、`client/*.sh` 中的逻辑，逐步迁移/收敛到 Python agent 中，由 `wg_adapter.py` 等模块统一管理真正的系统调用。
 
 ---
 
-## 🔵 4. 逻辑稳定优先：可调试、可追踪、可排错
+### 3.2 各层职责说明（精细版）
 
-系统必须具备强健的日志与错误处理体系。
+#### 3.2.1 UI 层（Bash：`wireguard.sh`）
 
-### 日志级别
+**定位：** 纯交互壳，负责与用户对话，所有实质操作都转发给 Python Agent。
 
-* DEBUG
-* INFO
-* WARN
-* ERROR
+**主要职责：**
 
-### 必须记录：
+* 显示交互式菜单（服务端 / 客户端 / 添加客户端 / 查看状态 / 日志等）
+* 收集用户输入（比如客户端名称、类型、内网子网）
+* 将用户选择转换为统一命令调用 Python：
 
-* 执行命令
-* 命令输出 stdout/stderr
-* 配置变更内容
-* 关键流程节点
-* 错误堆栈、返回码
+  ```bash
+  python3 -m agent.facade server init
+  python3 -m agent.facade server add-client --name client01 --type lan-node --lan-subnet 192.168.50.0/24
+  python3 -m agent.facade client import --from-file client01.conf
+  ```
+* 不直接操作配置文件，不直接调用 wg/ip/iptables
 
-### 日志格式规范
-
-```
-[YYYY-MM-DD HH:MM:SS] [LEVEL] [MODULE] message...
-```
-
-示例：
-
-```
-[2025-11-23 14:45:23] [INFO]  [server_init] 启动服务端初始化
-[2025-11-23 14:45:23] [DEBUG] [core_wg] 执行命令：wg genkey
-[2025-11-23 14:45:24] [ERROR] [core_net] NAT 设置失败，退出码：2
-```
-
-### 日志位置
-
-```
-/opt/wireguard-manager/logs/wireguard-manager.log
-```
-
-### Debug 模式应附加：
-
-* 调用的命令
-* 输出的 stdout / stderr
-* 文件路径
-* 关键变量
-* 失败回滚流程
+> 作用：
+>
+> * 把 Bash 限制在“UI”范围，避免 Shell 逻辑越写越乱。
+> * 如果未来改成 Web 界面/前端，只要替换 UI，下面整个 Agent 架构不用动。
 
 ---
 
-## 🔵 5. 模块接口定义规范（Input / Output / Side Effects）
+#### 3.2.2 Facade 层（Python：`agent/facade.py`）
 
-每个模块必须使用统一规范写明自身接口。
+**定位：** 对外的统一“门面”，封装所有命令入口，是 Bash / 其他调用者唯一需要认识的 Python 入口。
 
-### 模块接口统一模板
+**主要职责：**
 
-```
-模块名称：
-功能描述：
+* 解析 CLI 参数 → 统一转换为内部命令
+* 做最薄的一层权限与环境检查（例如 Python 版本、当前是否是 root）
+* 将命令转发给对应的 Controller 方法
 
-Input：
-  - 参数
-  - 环境变量
-  - 依赖模块
+示例接口：
 
-Output：
-  - 生成文件
-  - 配置变更
-  - 返回码
+```bash
+# 初始化服务端
+python3 -m agent.facade server init
 
-Side Effects：
-  - 修改系统配置
-  - 写入日志
-  - 修改 wg0.conf
+# 添加客户端
+python3 -m agent.facade server add-client --name client01 --type normal
 
-Error Handling：
-  - 错误范围
-  - 回滚策略
-  - 必须记录的日志内容
+# 客户端操作
+python3 -m agent.facade client status
 ```
 
-### 示例：server_add_client.sh
-
-```
-模块名称：
-  server_add_client.sh
-
-功能描述：
-  创建新的客户端节点，生成密钥、配置文件、二维码，写入服务端 wg0.conf。
-
-Input：
-  - 客户端名称
-  - 客户端类型（normal / lan-node）
-  - 公司内网子网（仅 lan-node）
-  - 环境变量（core_env.sh）
-  - 功能依赖：core_wg/core_config/core_net
-
-Output：
-  - private.key/public.key
-  - config.conf
-  - qrcode.png
-  - meta.json
-  - 更新 wg0.conf
-  - 返回码（0 成功）
-
-Side Effects：
-  - 修改 wg0.conf
-  - 写入 wg-data/clients/<client>/
-  - 日志输出
-
-Error Handling：
-  - 密钥生成失败 → 退出，记录 ERROR
-  - wg0.conf 写入失败 → 恢复备份
-  - 客户端目录已存在 → 提示冲突
-  - 所有异常必须写明命令与错误输出
-```
+> 作用：
+>
+> * 隔离 UI 与内部实现细节，避免 UI 直接绑死在 Controller/StateEngine 上。
+> * 为未来 REST API / RPC 接口预留空间（Facade 也可以换成 HTTP 层）。
 
 ---
 
-当然可以，我帮你把 **“长期 7x24 小时运行、不能中断”** 的要求无缝整合进你的文档，让它形成一个 **专业、严肃、生产可用级别的稳定性规范**。
+#### 3.2.3 Controller 层（Python：`agent/controller.py`）
 
-你可以直接复制下面这一整段，放入你的 README / 架构说明中：
+**定位：** 业务流程 orchestrator，负责“做一件完整事”的流程编排。
+
+**例子：添加客户端（伪流程）**
+
+```text
+UI → Facade → Controller.add_client()
+
+Controller.add_client() 做的事情：
+1. 校验参数（名称、类型、子网等）
+2. 通过 StateEngine 读取当前状态（现有客户端、已用 IP/端口）
+3. 生成新客户端的期望状态（desired client object）
+4. 发布事件：CLIENT_CREATE_REQUESTED
+5. 调用 StateEngine.apply_desired_state()
+6. 等待 StateEngine 完成对 WGAdapter 的调用并返回结果
+7. 根据结果记录日志，并返回给 Facade / UI
+```
+
+**主要职责：**
+
+* 将“业务动作”打包成明确的流程（init server / add client / delete client / reload / route update）
+* 与 EventBus 协同，将关键步骤（如客户端创建成功/失败）转化为事件
+* 不直接操作文件系统、不直接执行系统命令，这些全都交给 StateEngine + WGAdapter
+
+> 作用：
+>
+> * 把业务语义（“添加一个 client”）和实现细节分离。
+> * 以后要支持 WebHook、审计、回调，只要在 Controller 层挂事件/钩子就行。
 
 ---
 
-## 🔵 6. 稳定性要求：支持长期 7×24 小时持续运行（绝不能中断）
+#### 3.2.4 EventBus 层（Python：`agent/event_bus.py`）
 
-本脚本设计目标之一，是保证 WireGuard 服务 **长期保持稳定在线**，适用于生产环境的连续运行场景（如公司内网穿透、办公 VPN、远程运维等）。
+**定位：** 内部事件总线，用于解耦 Controller / StateEngine / 监控组件。
 
-为确保 7×24 小时高可用，脚本与整体架构必须满足以下稳定性要求：
+**典型事件：**
 
-### 🔹（1）服务端 WireGuard 必须具备“持续运行不间断”的能力
+* `CLIENT_CREATE_REQUESTED`
+* `CLIENT_CREATED`
+* `CLIENT_CREATE_FAILED`
+* `SERVER_INIT_COMPLETED`
+* `WG_RELOADED`
+* `HEALTH_CHECK_FAILED`
 
-* WireGuard 接口（wg0）必须在系统启动后自动运行
-* 意外终止后能自动重新启动
-* 不依赖人工手动启动
-* 服务端的 NAT / 路由规则必须持续有效，重启不会丢失
+**职责：**
 
-### 🔹（2）自动健康检查（可选但强烈推荐）
+* 提供订阅/发布（subscribe / publish）接口
+* Controller 发布业务事件；
+  StateEngine、监控模块、日志模块等可以订阅这些事件
+* 可用于：
 
-脚本架构需预留扩展点，用于未来加入以下功能：
+  * 统计（多少客户端创建成功）
+  * 告警（某个操作频繁失败）
+  * 将来扩展 Webhook / MQ 等
 
-* 监听 wg 接口状态（wg show）
-* 自动检查客户端握手时间（如 180 秒无握手 → 重新加载接口）
-* 自动检测服务端出口网卡变化（VPS 重启后 eth0 → ens3 等变化）
-* 检查 NAT/iptables 是否丢失（部分 VPS 重启容易丢规则）
-
-### 🔹（3）启动时自动修复机制（必须）
-
-每次运行 wireguard.sh 主脚本时，必须自动验证：
-
-* wg0 接口是否存在
-* wg0 是否处于 up 状态
-* NAT 是否存在（iptables -t nat -C POSTROUTING ...）
-* 系统转发（net.ipv4.ip_forward）是否为 1
-* 服务端配置文件是否损坏
-* 路由是否丢失（尤其是多子网）
-
-如果检测到异常，必须自动执行修复逻辑，并写入日志。
-
-### 🔹（4）持久化规则（不能因重启而中断）
-
-所有网络规则必须满足 **重启后自动恢复**：
-
-* sysctl（通过 /etc/sysctl.conf 持久化）
-* NAT 规则（可写入 /etc/iptables 或使用 iptables-persistent）
-* WireGuard 服务（systemd 服务 + wg-quick）
-* 多子网路由（route 或 systemd-networkd）
-
-确保任何一次重启都不会影响运行。
-
-### 🔹（5）防崩溃设计（必须）
-
-为了实现长期运行不中断，每个模块都必须包含：
-
-* 明确的错误处理逻辑
-* 失败后自动回滚
-* 失败不会破坏已有配置
-* 定位错误的详细日志
-
-特别是：
-
-* 添加客户端失败不能破坏 wg0.conf
-* NAT 失败必须恢复原来规则
-* 路由失败不能影响现有环境
-* 任何脚本崩溃都不能导致服务端完全不可用
-
-### 🔹（6）未来支持 systemd 自动重启（扩展点）
-
-脚本架构需支持未来添加 systemd：
-
-```
-Restart=always
-RestartSec=3
-```
-
-确保异常退出后自动拉起。
+> 作用：
+>
+> * 内部组件之间不再直接互相调用，减少耦合度。
+> * 方便后续增加“旁路”能力，比如：外部监控/报警/审计。
 
 ---
 
-## 🔵 7. 整体目标（总结）
+#### 3.2.5 StateEngine 层（Python：`agent/state_engine.py`）
 
-* 服务端与客户端角色清晰、分工明确
-* 所有配置由服务端统一生成
-* 客户端逻辑轻量、只负责连接
-* NAT / 转发 / 路由与多子网支持完备
-* 日志详细，可调试、可定位、可回滚
-* 架构统一稳定，高度可扩展
-**WireGuard 服务必须能够 365 天 × 24 小时持续运行，不因脚本错误、重启、网络波动而中断。**
-整个脚本与所有模块都需要围绕 **“高可用、自动恢复、自愈能力”** 的原则设计。
----
+**定位：** 整个系统的“状态大脑”，负责：**期望状态（desired state） → 实际状态（real world）** 的一致性。
 
-## ### WireGuard 网络架构图（文字版）
+**核心概念：**
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                        员工设备（Client）                 │
-│  - 仅导入服务端生成的配置                                 │
-│  - 无需公网                                               │
-│  - 可访问：VPN 网段 & 公司内网（由服务端统一转发）         │
-└───────────────▲────────────────────────────────────────┘
-                │
-                │ WireGuard 加密隧道
-                │（员工 → 服务端）
-                │
-┌───────────────┴────────────────────────────────────────┐
-│                        服务端（VPS）                    │
-│  ⭐ 必须有公网 IP                                        │
-│                                                          │
-│  核心职责：                                               │
-│  - 统一生成所有客户端的密钥与配置                        │
-│  - 分配地址（10.66.x.x/24 等）                           │
-│  - 管理 Peer 列表                                        │
-│  - 启用 IPv4/IPv6 转发                                   │
-│  - 配置 NAT / 防火墙                                     │
-│  - 维护路由策略                                          │
-│  - 负责跨子网转发（员工 → 服务端 → 公司内网节点）        │
-│                                                          │
-│  服务端是整个 WireGuard 网络的“流量中心”                │
-└───────────────▲────────────────────────────────────────┘
-                │
-                │ WireGuard 加密隧道
-                │（公司内网节点 → 服务端）
-                │
-┌───────────────┴────────────────────────────────────────┐
-│                    公司内网节点（WG Client）            │
-│  ⭐ 无需公网                                             │
-│                                                          │
-│  角色定位：公司内网的“出口代理节点”                      │
-│                                                          │
-│  客户端职责：                                             │
-│  - 使用服务端生成的配置连接 WireGuard                     │
-│  - 将本地公司内网子网（如 192.168.50.0/24）              │
-│    告诉服务端，由服务端写入 AllowedIPs                  │
-│  - 自动设置路由，让流量能从 VPN 进入本地内网              │
-│                                                          │
-│  这是员工访问公司内网的关键中转点                         │
-└───────────────▲────────────────────────────────────────┘
-                │
-                │ 局域网普通网络访问（非 VPN）
-                │
-┌───────────────┴────────────────────────────────────────┐
-│                     公司内网服务器 / 设备                │
-│  例如：                                                  │
-│  - 文件服务器（192.168.50.10）                           │
-│  - ERP/CRM                                               │
-│  - NAS                                                   │
-│  - 研发/测试服务器                                       │
-│                                                          │
-│  员工设备最终要访问的目标资源                            │
-└──────────────────────────────────────────────────────────┘
-```
+* Desired State（期望态）：
+  从 meta.json / 控制命令得出的应有配置：
+
+  * 有哪些客户端
+  * 每个客户端的 IP、端口、AllowedIPs
+  * 有哪些子网、路由、NAT 规则
+* Actual State（实际态）：
+  从系统读取的当前状态：
+
+  * 当前 wg0.conf 内容
+  * 当前 iptables 规则
+  * 当前 ip route 表
+  * 当前 wg show 输出
+
+**职责：**
+
+* 从存储（storage.py）加载当前期望配置（meta.json / wg-data）
+* 对比系统实际状态（wg_adapter.get_current_state()）
+* 生成差异（diff），决定：
+
+  * 需要新增哪些 Peer / 客户端
+  * 需要删除哪些过期配置
+  * 需要追加哪些路由 / NAT
+* 调用 WGAdapter 进行实际变更
+* 支持“自愈”：发现规则丢失时自动补回
+
+> 作用：
+>
+> * 把整个 WireGuard + 系统网络看作一个“状态机”，而不是一堆命令。
+> * 以后要做“声明式配置（像 K8s 那样）”时，只需要扩展 StateEngine。
 
 ---
 
+#### 3.2.6 WGAdapter 层（Python：`agent/wg_adapter.py`）
+
+**定位：** 对底层系统命令的统一适配，让上层不直接接触 `wg` / `ip` / `iptables` 等命令。
+
+**职责：**
+
+* 封装：
+
+  * `wg genkey` / `wg pubkey` / `wg show`
+  * `wg-quick up/down`
+  * `ip addr` / `ip route`
+  * `iptables` / `nftables`
+* 所有命令必须通过统一的执行函数（带日志 / 超时 / 返回码处理）：
+
+  ```python
+  run_cmd(["wg", "show"], timeout=3)
+  ```
+* 提供语义化方法：
+
+  * `create_interface(config)`
+  * `add_peer(peer)`
+  * `set_nat_rule(rule)`
+  * `enable_forwarding()`
+
+> 作用：
+>
+> * 如果未来想从 iptables 换成 nftables，只需要在 WGAdapter 中改实现，不动上层。
+> * 便于做命令级别的统一日志记录与错误处理。
+
+---
+
+#### 3.2.7 WireGuard 层（系统）
+
+**定位：** 实际的内核模块与用户态工具（`wg`、`wg-quick`），本项目不改动 WireGuard，只是通过 WGAdapter 调用。
+
+---
+
+### 3.3 Bash 与 Python 的分工总结
+
+* **Bash：**
+
+  * 只负责 UI/菜单/交互
+  * 调用 Python：`python3 -m agent.facade ...`
+  * 不做复杂逻辑，不操作文件、命令
+
+* **Python（Agent）：**
+
+  * 全面负责业务、状态、网络、配置、日志
+  * 通过分层架构（Facade → Controller → EventBus → StateEngine → WGAdapter）组织复杂逻辑
+  * 易于测试、易于扩展
+
+---
+
+### 3.4 与原有功能要求的映射关系（非常关键）
+
+* 原来文档里的：
+
+  * “服务端初始化” → `Controller.server_init()` + `StateEngine.init_server()` + `WGAdapter.*`
+  * “添加客户端” → `Controller.add_client()` → 发布事件 → `StateEngine.apply_desired_state()`
+  * “多子网路由 / NAT / 转发” → 封装在 `WGAdapter` 中，由 `StateEngine` 统一调度
+  * “智能识别公网 IP / 动态 MTU / 随机端口” → 封装在 `utils.py`，由 Controller/StateEngine 调用
+  * “详细日志” → 统一通过 `logger.py`，内部各层都不直接 `print`
+
+这样，你原有的需求全部被“投射”到了 Agent 分层结构中，
+**既保留了你当前已经设计好的业务逻辑，又升级到了一个更现代、更可维护的架构。**
+
+---
 
